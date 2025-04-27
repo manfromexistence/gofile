@@ -1,145 +1,186 @@
-import { Elysia, t, type Static } from 'elysia';
-import { html } from '@elysiajs/html';
-import axios from 'axios';
+import express from 'express';
+import type { Request, Response } from 'express'; // Use type-only import
+import puppeteer from 'puppeteer';
+import * as cheerio from 'cheerio'; // Changed to namespace import
+import path from 'path';
+import fs from 'fs/promises'; // Use promises for async file operations
 
-// Helper function for delay
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const app = express();
+const port = 3000;
 
-const app = new Elysia()
-  .use(html())
-  .get('/', () => `
+// Middleware to parse URL-encoded bodies (as sent by HTML forms)
+app.use(express.urlencoded({ extended: true }));
+
+// Middleware to serve static files (like screenshots)
+// Need to figure out __dirname in ES Modules context
+import { fileURLToPath } from 'url';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+app.use('/public', express.static(path.join(__dirname, 'public')));
+
+
+// Route to display the form
+app.get('/', (req: Request, res: Response) => {
+  res.send(`
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Fetch Website HTML</title>
-        <script src="https://cdn.tailwindcss.com"></script>
-        <style>
-            body { font-family: sans-serif; padding: 2rem; background-color: #f0f0f0; }
-            #result { white-space: pre-wrap; word-wrap: break-word; background-color: #fff; padding: 1rem; border: 1px solid #ccc; margin-top: 1rem; max-height: 60vh; overflow-y: auto; font-family: monospace;}
-            button { cursor: pointer; padding: 0.5rem 1rem; margin-left: 0.5rem; }
-            #loading { display: none; margin-top: 1rem; }
-            #copy-button { display: none; }
-        </style>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Gofile Video Fetcher</title>
+      <style>
+        body { font-family: sans-serif; margin: 2em; background-color: #f4f4f4; }
+        form { background: #fff; padding: 20px; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        label { display: block; margin-bottom: 8px; }
+        input[type="url"] { width: calc(100% - 22px); padding: 10px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 3px; }
+        button { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 3px; cursor: pointer; }
+        button:hover { background-color: #0056b3; }
+        .result { margin-top: 20px; padding: 15px; background: #e9ecef; border-radius: 5px; }
+        img { max-width: 100%; height: auto; margin-top: 10px; border: 1px solid #ddd; }
+        video { max-width: 100%; margin-top: 10px; border: 1px solid #ddd; }
+      </style>
     </head>
     <body>
-        <h1 class="text-2xl font-bold mb-4">Fetch Website HTML</h1>
-        <form id="fetch-form" class="flex items-center">
-            <input type="url" id="url" name="url" placeholder="Enter website URL (e.g., https://example.com)" required class="border p-2 flex-grow mr-2">
-            <button type="submit" class="bg-blue-500 text-white p-2 rounded hover:bg-blue-600">Fetch HTML</button>
-        </form>
-
-        <div id="loading" class="text-gray-600">Fetching after delay... please wait.</div>
-        <div id="error" class="text-red-500 mt-2"></div>
-
-        <div class="mt-4">
-            <button id="copy-button" class="bg-green-500 text-white p-2 rounded hover:bg-green-600">Copy to Clipboard</button>
-        </div>
-        <pre id="result"></pre>
-
-        <script>
-            const form = document.getElementById('fetch-form');
-            const urlInput = document.getElementById('url');
-            const resultDiv = document.getElementById('result');
-            const errorDiv = document.getElementById('error');
-            const loadingDiv = document.getElementById('loading');
-            const copyButton = document.getElementById('copy-button');
-
-            form.addEventListener('submit', async function(event) {
-                event.preventDefault();
-                var url = urlInput.value;
-                resultDiv.textContent = '';
-                errorDiv.textContent = '';
-                loadingDiv.style.display = 'block';
-                copyButton.style.display = 'none';
-
-                try {
-                    var response = await fetch('/fetch', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
-                        body: JSON.stringify({ url: url }),
-                    });
-
-                    loadingDiv.style.display = 'none';
-
-                    if (!response.ok) {
-                        var errorData = await response.json();
-                        throw new Error((errorData && errorData.error) ? errorData.error : 'HTTP error! status: ' + response.status);
-                    }
-
-                    var data = await response.json();
-                    resultDiv.textContent = data.html;
-                    copyButton.style.display = 'inline-block';
-                } catch (e) {
-                    console.error('Fetch error:', e);
-                    errorDiv.textContent = 'Error: ' + (e && e.message ? e.message : e);
-                    loadingDiv.style.display = 'none';
-                    copyButton.style.display = 'none';
-                }
-            });
-
-            copyButton.addEventListener('click', function() {
-                navigator.clipboard.writeText(resultDiv.textContent)
-                    .then(function() {
-                        alert('HTML copied to clipboard!');
-                    })
-                    .catch(function(err) {
-                        console.error('Failed to copy text: ', err);
-                        alert('Failed to copy HTML.');
-                    });
-            });
-        </script>
+      <h1>Enter Gofile Download URL</h1>
+      <form action="/fetch" method="POST">
+        <label for="gofileUrl">Gofile URL:</label>
+        <input type="url" id="gofileUrl" name="gofileUrl" required>
+        <button type=\"submit\">Fetch Video</button>
+      </form>
     </body>
     </html>
-  `)
-  .post('/fetch', async ({ body }: { body: { url: string } }) => {
-      const { url } = body;
-      console.log(`Received request to fetch: ${url}`);
+  `);
+});
 
-      // Add a delay (e.g., 5 seconds)
-      const delaySeconds = 30;
-      console.log(`Waiting for ${delaySeconds} seconds...`);
-      await sleep(delaySeconds * 1000);
-      console.log('Delay finished. Fetching HTML...');
+// Route to handle form submission and fetch video
+// Explicitly type the handler return as Promise<void> to fix overload error
+app.post('/fetch', async (req: Request, res: Response): Promise<void> => {
+  const gofileUrl = req.body.gofileUrl;
 
-      try {
-          const response = await axios.get(url, {
-              headers: {
-                  // Add headers to mimic a browser if needed
-                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-              },
-              timeout: 15000 // Add a timeout for the axios request itself (15 seconds)
-          });
-          console.log(`Successfully fetched HTML from ${url}`);
-          return { html: response.data };
-      } catch (error: any) {
-          console.error(`Error fetching ${url}:`, error.message);
-          // Check for specific axios errors or return a generic message
-          let errorMessage = 'Failed to fetch HTML.';
-          if (axios.isAxiosError(error)) {
-              errorMessage = error.response?.data || error.message || errorMessage;
-              if (error.code === 'ECONNABORTED') {
-                  errorMessage = 'Request timed out.';
-              }
-          } else if (error instanceof Error) {
-              errorMessage = error.message;
-          }
-          // Return an error status code and message
-          return new Response(JSON.stringify({ error: errorMessage }), {
-              status: 500,
-              headers: { 'Content-Type': 'application/json' }
-          });
-      }
-  }, {
-      body: t.Object({
-          url: t.String({ format: 'uri' }) // Validate input as a URI
-      })
-  })
-  .listen(3000);
+  if (!gofileUrl || typeof gofileUrl !== 'string') {
+     res.status(400).send('Invalid URL provided.');
+     return; // Ensure function exits
+  }
 
-console.log(
-  `🦊 Elysia is running at http://${app.server?.hostname}:${app.server?.port}`
-);
+  let browser;
+  try {
+    console.log(`Fetching URL: ${gofileUrl}`);
+    browser = await puppeteer.launch({
+      headless: true, // Changed from 'new' to boolean true
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    });
+    const page = await browser.newPage();
+    await page.goto(gofileUrl, { waitUntil: 'networkidle2', timeout: 60000 }); // Increased timeout
+
+    // Wait for potential video element
+    const mediaSelector = 'video source[src], video[src]'; // Look for video source or video with src
+    let videoSrc: string | null = null;
+    let screenshotPathRelative: string | null = null;
+
+    try {
+        await page.waitForSelector(mediaSelector, { timeout: 30000 }); // Wait longer if needed
+        console.log('Video element selector found.');
+
+        videoSrc = await page.evaluate((selector) => {
+            const element = document.querySelector(selector);
+            // Check if it's a source element inside a video or the video itself
+            return element ? element.getAttribute('src') : null;
+        }, mediaSelector);
+
+        if (videoSrc) {
+             console.log(`Found video source via Puppeteer: ${videoSrc}`);
+        } else {
+            console.log('Video source not found directly via Puppeteer, trying Cheerio fallback.');
+        }
+
+    } catch (e) {
+        console.warn('Video element selector not found within timeout via Puppeteer.');
+    }
+
+
+    // Take screenshot regardless of finding the video element initially
+    const screenshotFilename = `screenshot_${Date.now()}.png`;
+    const screenshotPathAbsolute = path.join(__dirname, 'public', screenshotFilename);
+    await fs.mkdir(path.join(__dirname, 'public'), { recursive: true }); // Ensure public dir exists
+    await page.screenshot({ path: screenshotPathAbsolute, fullPage: true });
+    screenshotPathRelative = `/public/${screenshotFilename}`; // Path for HTML src attribute
+    console.log(`Screenshot saved to ${screenshotPathAbsolute}`);
+
+
+    // If Puppeteer didn't find the src, try parsing the full HTML with Cheerio as a fallback
+    if (!videoSrc) {
+        console.log('Attempting Cheerio fallback...');
+        const html = await page.content();
+        const $ = cheerio.load(html);
+        const videoElement = $('video source[src]').first() || $('video[src]').first(); // Check source first, then video tag
+        videoSrc = videoElement.attr('src') || null;
+        if (videoSrc) {
+            console.log(`Found video source via Cheerio: ${videoSrc}`);
+        } else {
+            console.log('Video source not found via Cheerio either.');
+        }
+    }
+
+    await browser.close();
+    browser = null; // Ensure browser is marked as closed
+
+    // Send response back to client
+    res.send(`
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="UTF-8">
+        <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">
+        <title>Gofile Video Result</title>
+         <style>
+            body { font-family: sans-serif; margin: 2em; background-color: #f4f4f4; }
+            .result { margin-top: 20px; padding: 15px; background: #fff; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+            h1, h2 { color: #333; }
+            a { color: #007bff; }
+            img { max-width: 100%; height: auto; margin-top: 10px; border: 1px solid #ddd; display: block; }
+            video { max-width: 100%; margin-top: 10px; border: 1px solid #ddd; display: block; }
+            p { word-wrap: break-word; }
+        </style>
+      </head>
+      <body>
+        <div class=\"result\">
+          <h1>Result for: ${gofileUrl}</h1>
+          ${videoSrc ? `
+            <h2>Video Found</h2>
+            <p>Video URL: <a href=\"${videoSrc}\" target=\"_blank\">${videoSrc}</a></p>
+            <video controls>
+              <source src=\"${videoSrc}\" type=\"video/webm\"> <!-- Assuming webm, adjust if needed -->
+              Your browser does not support the video tag.
+            </video>
+          ` : `
+            <h2>Video Not Found</h2>
+            <p>Could not automatically extract a video source URL from the page.</p>
+          `}
+
+          ${screenshotPathRelative ? `
+            <h2>Page Screenshot</h2>
+            <img src=\"${screenshotPathRelative}\" alt=\"Screenshot of ${gofileUrl}\">
+          ` : `
+            <p>Screenshot could not be generated.</p>
+          `}
+        </div>
+        <a href=\"/\">Try another URL</a>
+      </body>
+      </html>
+    `);
+
+  } catch (error) {
+    console.error('Error processing request:', error);
+    if (browser) {
+        await browser.close(); // Ensure browser is closed on error
+    }
+    // Ensure response is sent even on error
+    if (!res.headersSent) {
+        res.status(500).send(`Error fetching or processing the URL: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+});
+
+app.listen(port, () => {
+  console.log(`Server listening at http://localhost:${port}`);
+});
