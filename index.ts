@@ -238,8 +238,6 @@ app.post('/fetch', async ({ body, set, html: htmlResponse }) => {
             <source src="/video/${contentId}" type="video/webm">
             Your browser does not support the video tag.
           </video>
-          <h4>View in Gofile Player (Iframe)</h4>
-          <iframe src="${gofileUrl}" width="800" height="600" style="border: 1px solid #ccc;"></iframe>
         ` : `
           <h3>Video Not Found</h3>
           <p>Could not extract video source or content ID.</p>
