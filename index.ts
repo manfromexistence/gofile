@@ -6,7 +6,7 @@ import * as cheerio from 'cheerio';
 import path from 'path';
 import fs from 'fs/promises';
 import { fileURLToPath } from 'url';
-import fetch from 'node-fetch'; // Add node-fetch for backend video fetching
+import fetch, { Headers } from 'node-fetch'; // Import Headers
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -19,6 +19,9 @@ const app = new Elysia()
   }));
 
 const port = 3000;
+
+// In-memory cache for video details
+const videoCache = new Map<string, { videoSrc: string; cookieHeader: string }>();
 
 // Route to display the form
 app.get('/', ({ html }) => html(`
@@ -50,64 +53,102 @@ app.get('/', ({ html }) => html(`
     </html>
   `));
 
-// New route to proxy video content
-app.get('/video/:contentId', async ({ params, set }) => {
+// Updated route to proxy video content with streaming and caching
+app.get('/video/:contentId', async ({ params, set, request }) => {
+  const contentId = params.contentId;
   let browser: puppeteer.Browser | null = null;
+  let videoSrc: string | null = null;
+  let cookieHeader: string | null = null;
+
   try {
-    const contentId = params.contentId;
-    const gofileUrl = `https://gofile.io/d/${contentId}`;
+    // 1. Check cache first
+    if (videoCache.has(contentId)) {
+      const cachedData = videoCache.get(contentId)!;
+      videoSrc = cachedData.videoSrc;
+      cookieHeader = cachedData.cookieHeader;
+      console.log(`Cache hit for contentId: ${contentId}`);
+    } else {
+      // 2. If not in cache, use Puppeteer to get details
+      console.log(`Cache miss for contentId: ${contentId}. Fetching details...`);
+      const gofileUrl = `https://gofile.io/d/${contentId}`;
+      browser = await puppeteer.launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      });
+      const page = await browser.newPage();
+      await page.goto(gofileUrl, { waitUntil: 'networkidle2', timeout: 60000 }); // Increased timeout
 
-    browser = await puppeteer.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    });
-    const page = await browser.newPage();
-    await page.goto(gofileUrl, { waitUntil: 'networkidle2', timeout: 50000 });
+      const mediaSelector = 'video source[src], video[src]';
+      await page.waitForSelector(mediaSelector, { timeout: 45000 }); // Increased timeout
 
-    const mediaSelector = 'video source[src], video[src]';
-    await page.waitForSelector(mediaSelector, { timeout: 30000 });
+      videoSrc = await page.evaluate((selector: string) => {
+        const element = document.querySelector(selector);
+        return element ? element.getAttribute('src') : null;
+      }, mediaSelector);
 
-    const videoSrc = await page.evaluate((selector: string) => {
-      const element = document.querySelector(selector);
-      return element ? element.getAttribute('src') : null;
-    }, mediaSelector);
+      if (!videoSrc) {
+        throw new Error('Video source not found after waiting');
+      }
 
-    if (!videoSrc) {
-      throw new Error('Video source not found');
+      const cookies = await page.cookies();
+      cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+      // Store in cache
+      videoCache.set(contentId, { videoSrc, cookieHeader });
+      console.log(`Cached details for contentId: ${contentId}`);
+
+      await browser.close(); // Close browser once details are fetched
+      browser = null;
     }
 
-    // Get cookies for the video request
-    const cookies = await page.cookies();
-    const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+    // 3. Fetch and stream the video
+    if (!videoSrc || !cookieHeader) {
+        throw new Error('Missing video source or cookies for streaming.');
+    }
 
-    // Fetch video content with cookies
-    const response = await fetch(videoSrc, {
-      headers: {
+    console.log(`Streaming video from: ${videoSrc}`);
+
+    // Include Range header from client request if present
+    const rangeHeader = request.headers.get('range');
+    const fetchHeaders = new Headers({
         Cookie: cookieHeader,
-        Accept: 'video/webm',
-      },
+        Accept: 'video/webm, video/mp4, */*', // Accept common video types
+    });
+    if (rangeHeader) {
+        fetchHeaders.set('Range', rangeHeader);
+        console.log(`Forwarding Range header: ${rangeHeader}`);
+    }
+
+    const response = await fetch(videoSrc, {
+      headers: fetchHeaders,
+      // Do NOT buffer the response body for streaming
     });
 
     if (!response.ok) {
-      throw new Error(`Failed to fetch video: ${response.statusText}`);
+        const errorBody = await response.text();
+        console.error(`Gofile fetch error: ${response.status} ${response.statusText}`, errorBody);
+        throw new Error(`Failed to fetch video stream: ${response.statusText}`);
     }
 
-    // Log response headers for debugging
-    console.log('Video response headers:', Object.fromEntries(response.headers));
+    // Set response headers based on Gofile's response
+    set.headers['Content-Type'] = response.headers.get('content-type') || 'video/webm';
+    set.headers['Accept-Ranges'] = response.headers.get('accept-ranges') || 'bytes';
+    const contentLength = response.headers.get('content-length');
+    if (contentLength) {
+        set.headers['Content-Length'] = contentLength;
+    }
+    const contentRange = response.headers.get('content-range');
+     if (contentRange) {
+        set.headers['Content-Range'] = contentRange;
+    }
 
-    const videoBuffer = await response.arrayBuffer();
+    // Set status code (e.g., 206 Partial Content if range request was successful)
+    set.status = response.status;
 
-    await browser.close();
-    browser = null;
+    // Return the readable stream directly
+    // response.body is already a ReadableStream
+    return response.body;
 
-    // Set headers to ensure video streams
-    set.headers['Content-Type'] = 'video/webm';
-    set.headers['Content-Disposition'] = 'inline';
-    set.headers['Accept-Ranges'] = 'bytes';
-
-    return new Response(videoBuffer, {
-      status: 200,
-    });
   } catch (error) {
     console.error('Error in video proxy:', error);
     if (browser) {
