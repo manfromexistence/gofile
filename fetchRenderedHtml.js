@@ -23,6 +23,11 @@ async function fetchRenderedHtml(url) {
         media.addEventListener('loadeddata', resolve, { once: true });
       });
     }, mediaSelector);
+
+    // Add an explicit wait for a few more seconds
+    console.log('Waiting an additional 5 seconds for media source...');
+    await page.waitForTimeout(5000);
+
   } catch (e) {
     console.warn('Media element not found or not loaded in time.');
   }
