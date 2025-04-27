@@ -216,53 +216,51 @@ app.post('/fetch', async ({ body, set, html: htmlResponse }) => {
     await browser.close();
     browser = null;
 
-    // Save original HTML
-    const outputFilePath = path.join(__dirname, 'output.html');
-    try {
-      await fs.writeFile(outputFilePath, fetchedHtml);
-      console.log(`Original fetched HTML saved to ${outputFilePath}`);
-    } catch (writeError) {
-      console.error(`Error writing HTML: ${writeError}`);
-    }
-
     // Construct results HTML
     const resultsHtml = `
-      <div style="border: 2px solid blue; padding: 15px; margin: 10px; background-color: #eee; color: #333; font-family: sans-serif;">
-        <h2>Extraction Results</h2>
-        <p>Original URL: <a href="${gofileUrl}" target="_blank">${gofileUrl}</a></p>
-        ${videoSrc && contentId ? `
-          <h3>Video Found</h3>
-          <p>Video URL: <a href="${videoSrc}" target="_blank">${videoSrc}</a></p>
-          <h4>Stream via Proxy</h4>
-          <video controls style="max-width: 100%; margin-top: 10px; border: 1px solid #ccc;">
-            <source src="/video/${contentId}" type="video/webm">
-            Your browser does not support the video tag.
-          </video>
-        ` : `
-          <h3>Video Not Found</h3>
-          <p>Could not extract video source or content ID.</p>
-        `}
-        ${screenshotPathRelative ? `
-          <h3>Page Screenshot</h3>
-          <img src="${screenshotPathRelative}" alt="Screenshot of ${gofileUrl}" style="max-width: 100%; height: auto; margin-top: 10px; border: 1px solid #ccc; display: block;">
-        ` : `
-          <p>Screenshot could not be generated.</p>
-        `}
-        <hr style="margin: 15px 0;">
-        <p><a href="/">Try another URL</a></p>
-      </div>
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Gofile Fetch Results</title>
+        <style>
+          body { font-family: sans-serif; margin: 2em; background-color: #f4f4f4; }
+          .result { margin-top: 20px; padding: 15px; background: #e9ecef; border-radius: 5px; }
+          img, video { max-width: 100%; height: auto; margin-top: 10px; border: 1px solid #ddd; }
+        </style>
+      </head>
+      <body>
+        <div class="result">
+          <h2>Extraction Results</h2>
+          <p>Original URL: <a href="${gofileUrl}" target="_blank">${gofileUrl}</a></p>
+          ${videoSrc && contentId ? `
+            <h3>Video Found</h3>
+            <p>Video URL: <a href="${videoSrc}" target="_blank">${videoSrc}</a></p>
+            <h4>Stream via Proxy</h4>
+            <video controls style="max-width: 100%; margin-top: 10px; border: 1px solid #ccc;">
+              <source src="/video/${contentId}" type="video/webm">
+              Your browser does not support the video tag.
+            </video>
+          ` : `
+            <h3>Video Not Found</h3>
+            <p>Could not extract video source or content ID.</p>
+          `}
+          ${screenshotPathRelative ? `
+            <h3>Page Screenshot</h3>
+            <img src="${screenshotPathRelative}" alt="Screenshot of ${gofileUrl}" style="max-width: 100%; height: auto; margin-top: 10px; border: 1px solid #ccc; display: block;">
+          ` : `
+            <p>Screenshot could not be generated.</p>
+          `}
+          <hr style="margin: 15px 0;">
+          <p><a href="/">Try another URL</a></p>
+        </div>
+      </body>
+      </html>
     `;
 
-    // Inject results into HTML
-    const headEndIndex = fetchedHtml.toLowerCase().indexOf('</head>');
-    let modifiedHtmlResponse = fetchedHtml;
-    if (headEndIndex !== -1) {
-      modifiedHtmlResponse = fetchedHtml.slice(0, headEndIndex + 7) + resultsHtml + fetchedHtml.slice(headEndIndex + 7);
-    } else {
-      modifiedHtmlResponse = resultsHtml + fetchedHtml;
-    }
-
-    return htmlResponse(modifiedHtmlResponse);
+    // Return only the results HTML
+    return htmlResponse(resultsHtml);
   } catch (error) {
     console.error('Error processing request:', error);
     if (browser) {
