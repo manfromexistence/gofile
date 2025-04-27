@@ -1,25 +1,26 @@
-import { Elysia, t } from 'elysia'; // Import Elysia and t for validation
-import { html } from '@elysiajs/html'; // Import html plugin
-import staticPlugin from '@elysiajs/static'; // Import static plugin
-import * as puppeteer from 'puppeteer'; // Use namespace import
+import { Elysia, t } from 'elysia';
+import { html } from '@elysiajs/html';
+import staticPlugin from '@elysiajs/static';
+import * as puppeteer from 'puppeteer';
 import * as cheerio from 'cheerio';
 import path from 'path';
 import fs from 'fs/promises';
 import { fileURLToPath } from 'url';
+import fetch from 'node-fetch'; // Add node-fetch for backend video fetching
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = new Elysia()
-  .use(html()) // Use the HTML plugin
-  .use(staticPlugin({ // Use the static plugin to serve 'public' directory
+  .use(html())
+  .use(staticPlugin({
     assets: path.join(__dirname, 'public'),
     prefix: '/public'
   }));
 
 const port = 3000;
 
-// Route to display the form using @elysiajs/html
+// Route to display the form
 app.get('/', ({ html }) => html(`
     <!DOCTYPE html>
     <html lang="en">
@@ -35,8 +36,7 @@ app.get('/', ({ html }) => html(`
         button { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 3px; cursor: pointer; }
         button:hover { background-color: #0056b3; }
         .result { margin-top: 20px; padding: 15px; background: #e9ecef; border-radius: 5px; }
-        img { max-width: 100%; height: auto; margin-top: 10px; border: 1px solid #ddd; }
-        video { max-width: 100%; margin-top: 10px; border: 1px solid #ddd; }
+        img, video, iframe { max-width: 100%; height: auto; margin-top: 10px; border: 1px solid #ddd; }
       </style>
     </head>
     <body>
@@ -50,19 +50,84 @@ app.get('/', ({ html }) => html(`
     </html>
   `));
 
+// New route to proxy video content
+app.get('/video/:contentId', async ({ params, set }) => {
+  let browser: puppeteer.Browser | null = null;
+  try {
+    const contentId = params.contentId;
+    const gofileUrl = `https://gofile.io/d/${contentId}`;
 
-// Route to handle form submission and fetch video
-// Use Elysia's context (ctx) and body validation
-app.post('/fetch', async ({ body, set, html: htmlResponse }) => { // Destructure context, use htmlResponse alias
+    browser = await puppeteer.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    });
+    const page = await browser.newPage();
+    await page.goto(gofileUrl, { waitUntil: 'networkidle2', timeout: 50000 });
+
+    const mediaSelector = 'video source[src], video[src]';
+    await page.waitForSelector(mediaSelector, { timeout: 30000 });
+
+    const videoSrc = await page.evaluate((selector: string) => {
+      const element = document.querySelector(selector);
+      return element ? element.getAttribute('src') : null;
+    }, mediaSelector);
+
+    if (!videoSrc) {
+      throw new Error('Video source not found');
+    }
+
+    // Get cookies for the video request
+    const cookies = await page.cookies();
+    const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+    // Fetch video content with cookies
+    const response = await fetch(videoSrc, {
+      headers: {
+        Cookie: cookieHeader,
+        Accept: 'video/webm',
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch video: ${response.statusText}`);
+    }
+
+    // Log response headers for debugging
+    console.log('Video response headers:', Object.fromEntries(response.headers));
+
+    const videoBuffer = await response.arrayBuffer();
+
+    await browser.close();
+    browser = null;
+
+    // Set headers to ensure video streams
+    set.headers['Content-Type'] = 'video/webm';
+    set.headers['Content-Disposition'] = 'inline';
+    set.headers['Accept-Ranges'] = 'bytes';
+
+    return new Response(videoBuffer, {
+      status: 200,
+    });
+  } catch (error) {
+    console.error('Error in video proxy:', error);
+    if (browser) {
+      await browser.close();
+    }
+    set.status = 500;
+    return `Error fetching video: ${error instanceof Error ? error.message : String(error)}`;
+  }
+});
+
+// Updated route to handle form submission and fetch video
+app.post('/fetch', async ({ body, set, html: htmlResponse }) => {
   const gofileUrl = body.gofileUrl;
 
-  // Validation is handled by Elysia's schema below, but keep basic check just in case
   if (!gofileUrl || typeof gofileUrl !== 'string') {
-     set.status = 400;
-     return 'Invalid URL provided.';
+    set.status = 400;
+    return 'Invalid URL provided.';
   }
 
-  let browser: puppeteer.Browser | null = null; // Correct type for browser
+  let browser: puppeteer.Browser | null = null;
   try {
     console.log(`Fetching URL: ${gofileUrl}`);
     browser = await puppeteer.launch({
@@ -70,124 +135,115 @@ app.post('/fetch', async ({ body, set, html: htmlResponse }) => { // Destructure
       args: ['--no-sandbox', '--disable-setuid-sandbox'],
     });
     const page = await browser.newPage();
-    // Increased timeout to 50 seconds (50000 ms)
     await page.goto(gofileUrl, { waitUntil: 'networkidle2', timeout: 50000 });
 
-    // Wait for potential video element
-    const mediaSelector = 'video source[src], video[src]'; // Look for video source or video with src
+    const mediaSelector = 'video source[src], video[src]';
     let videoSrc: string | null = null;
     let screenshotPathRelative: string | null = null;
+    let contentId: string | null = null;
 
-    try {
-        await page.waitForSelector(mediaSelector, { timeout: 30000 }); // Wait longer if needed
-        console.log('Video element selector found.');
-
-        // Wait for the media to potentially load its source attribute
-        await page.evaluate((selector: string) => { // Add type for selector
-            const media = document.querySelector(selector);
-            return new Promise<void>((resolve) => { // Explicitly type Promise
-                if (!media) return resolve();
-                // Check if src is already present
-                if (media.getAttribute('src')) return resolve();
-                // If not, wait for potential dynamic loading (basic check)
-                const observer = new MutationObserver((mutations) => {
-                    for (const mutation of mutations) {
-                        if (mutation.type === 'attributes' && mutation.attributeName === 'src') {
-                            if (media.getAttribute('src')) {
-                                observer.disconnect();
-                                resolve();
-                                return;
-                            }
-                        }
-                    }
-                });
-                observer.observe(media, { attributes: true });
-                // Also resolve after a timeout if src doesn't appear
-                setTimeout(() => {
-                     observer.disconnect();
-                     resolve();
-                }, 5000); // Wait up to 5 seconds for src attribute
-            });
-        }, mediaSelector);
-
-
-        videoSrc = await page.evaluate((selector: string) => { // Add type for selector
-            const element = document.querySelector(selector);
-            // Check if it's a source element inside a video or the video itself
-            return element ? element.getAttribute('src') : null;
-        }, mediaSelector);
-
-        if (videoSrc) {
-             console.log(`Found video source via Puppeteer: ${videoSrc}`);
-        } else {
-            console.log('Video source not found directly via Puppeteer after waiting, trying Cheerio fallback.');
-        }
-
-    } catch (e) {
-        console.warn('Video element selector not found within timeout via Puppeteer.');
+    // Extract content ID from URL
+    const urlMatch = gofileUrl.match(/gofile\.io\/d\/([a-zA-Z0-9-]+)/);
+    if (urlMatch) {
+      contentId = urlMatch[1] ?? null;
     }
 
-    // Add an explicit wait *after* attempting to find the element and its src
-    console.log('Waiting an additional 5 seconds before screenshot/fallback...');
-    await new Promise(resolve => setTimeout(resolve, 5000)); // Use standard setTimeout
+    try {
+      await page.waitForSelector(mediaSelector, { timeout: 30000 });
+      console.log('Video element selector found.');
 
+      await page.evaluate((selector: string) => {
+        const media = document.querySelector(selector);
+        return new Promise<void>((resolve) => {
+          if (!media) return resolve();
+          if (media.getAttribute('src')) return resolve();
+          const observer = new MutationObserver((mutations) => {
+            for (const mutation of mutations) {
+              if (mutation.type === 'attributes' && mutation.attributeName === 'src') {
+                if (media.getAttribute('src')) {
+                  observer.disconnect();
+                  resolve();
+                  return;
+                }
+              }
+            }
+          });
+          observer.observe(media, { attributes: true });
+          setTimeout(() => {
+            observer.disconnect();
+            resolve();
+          }, 5000);
+        });
+      }, mediaSelector);
 
-    // Take screenshot regardless of finding the video element initially
+      videoSrc = await page.evaluate((selector: string) => {
+        const element = document.querySelector(selector);
+        return element ? element.getAttribute('src') : null;
+      }, mediaSelector);
+
+      if (videoSrc) {
+        console.log(`Found video source via Puppeteer: ${videoSrc}`);
+      }
+    } catch (e) {
+      console.warn('Video element selector not found within timeout.');
+    }
+
+    // Wait an additional 5 seconds
+    await new Promise(resolve => setTimeout(resolve, 5000));
+
+    // Take screenshot
     const screenshotFilename = `screenshot_${Date.now()}.png`;
     const screenshotPathAbsolute = path.join(__dirname, 'public', screenshotFilename);
-    await fs.mkdir(path.join(__dirname, 'public'), { recursive: true }); // Ensure public dir exists
+    await fs.mkdir(path.join(__dirname, 'public'), { recursive: true });
     await page.screenshot({ path: screenshotPathAbsolute, fullPage: true });
-    screenshotPathRelative = `/public/${screenshotFilename}`; // Path for HTML src attribute
+    screenshotPathRelative = `/public/${screenshotFilename}`;
     console.log(`Screenshot saved to ${screenshotPathAbsolute}`);
 
-
-    // Get the full page content *before* closing the browser
+    // Fallback to Cheerio if Puppeteer fails
     let fetchedHtml = await page.content();
-
-    // If Puppeteer didn't find the src, try parsing the full HTML with Cheerio as a fallback
     if (!videoSrc) {
-        console.log('Attempting Cheerio fallback...');
-        const $ = cheerio.load(fetchedHtml); // Use the already fetched HTML
-        const videoElement = $('video source[src]').first() || $('video[src]').first(); // Check source first, then video tag
-        videoSrc = videoElement.attr('src') || null;
-        if (videoSrc) {
-            console.log(`Found video source via Cheerio: ${videoSrc}`);
-        } else {
-            console.log('Video source not found via Cheerio either.');
-        }
+      console.log('Attempting Cheerio fallback...');
+      const $ = cheerio.load(fetchedHtml);
+      const videoElement = $('video source[src]').first() || $('video[src]').first();
+      videoSrc = videoElement.attr('src') || null;
+      if (videoSrc) {
+        console.log(`Found video source via Cheerio: ${videoSrc}`);
+      } else {
+        console.log('Video source not found via Cheerio.');
+      }
     }
 
     await browser.close();
-    browser = null; // Ensure browser is marked as closed
+    browser = null;
 
-    // Save the *original* fetched HTML to output.html
+    // Save original HTML
     const outputFilePath = path.join(__dirname, 'output.html');
     try {
-        await fs.writeFile(outputFilePath, fetchedHtml); // Save the original fetched HTML
-        console.log(`Original fetched HTML saved to ${outputFilePath}`);
+      await fs.writeFile(outputFilePath, fetchedHtml);
+      console.log(`Original fetched HTML saved to ${outputFilePath}`);
     } catch (writeError) {
-        console.error(`Error writing original HTML to output.html: ${writeError}`);
-        // Decide if this error should prevent response or just be logged
+      console.error(`Error writing HTML: ${writeError}`);
     }
 
-
-    // Construct the results HTML to inject into the response
+    // Construct results HTML
     const resultsHtml = `
       <div style="border: 2px solid blue; padding: 15px; margin: 10px; background-color: #eee; color: #333; font-family: sans-serif;">
         <h2>Extraction Results</h2>
         <p>Original URL: <a href="${gofileUrl}" target="_blank">${gofileUrl}</a></p>
-        ${videoSrc ? `
+        ${videoSrc && contentId ? `
           <h3>Video Found</h3>
           <p>Video URL: <a href="${videoSrc}" target="_blank">${videoSrc}</a></p>
+          <h4>Stream via Proxy</h4>
           <video controls style="max-width: 100%; margin-top: 10px; border: 1px solid #ccc;">
-            <source src="${videoSrc}" type="video/webm"> <!-- Assuming webm, adjust if needed -->
+            <source src="/video/${contentId}" type="video/webm">
             Your browser does not support the video tag.
           </video>
+          <h4>View in Gofile Player (Iframe)</h4>
+          <iframe src="${gofileUrl}" width="800" height="600" style="border: 1px solid #ccc;"></iframe>
         ` : `
           <h3>Video Not Found</h3>
-          <p>Could not automatically extract a video source URL from the page.</p>
+          <p>Could not extract video source or content ID.</p>
         `}
-
         ${screenshotPathRelative ? `
           <h3>Page Screenshot</h3>
           <img src="${screenshotPathRelative}" alt="Screenshot of ${gofileUrl}" style="max-width: 100%; height: auto; margin-top: 10px; border: 1px solid #ccc; display: block;">
@@ -199,34 +255,29 @@ app.post('/fetch', async ({ body, set, html: htmlResponse }) => { // Destructure
       </div>
     `;
 
-    // Inject the results HTML into the original page content for the response
-    // Find the closing </head> tag and insert results after it (simple approach)
+    // Inject results into HTML
     const headEndIndex = fetchedHtml.toLowerCase().indexOf('</head>');
     let modifiedHtmlResponse = fetchedHtml;
     if (headEndIndex !== -1) {
-        modifiedHtmlResponse = fetchedHtml.slice(0, headEndIndex + 7) + resultsHtml + fetchedHtml.slice(headEndIndex + 7);
+      modifiedHtmlResponse = fetchedHtml.slice(0, headEndIndex + 7) + resultsHtml + fetchedHtml.slice(headEndIndex + 7);
     } else {
-        // Fallback: prepend to the whole HTML if </head> not found
-        modifiedHtmlResponse = resultsHtml + fetchedHtml;
+      modifiedHtmlResponse = resultsHtml + fetchedHtml;
     }
 
-    // Send the MODIFIED HTML response back to client using Elysia's html helper
-    return htmlResponse(modifiedHtmlResponse); // Use the aliased htmlResponse
-
+    return htmlResponse(modifiedHtmlResponse);
   } catch (error) {
     console.error('Error processing request:', error);
     if (browser) {
-        try { // Add try-catch for browser close on error
-           await browser.close();
-        } catch (closeError) {
-           console.error('Error closing browser after main error:', closeError);
-        }
+      try {
+        await browser.close();
+      } catch (closeError) {
+        console.error('Error closing browser:', closeError);
+      }
     }
     set.status = 500;
-    // Return error message as plain text
     return `Error fetching or processing the URL: ${error instanceof Error ? error.message : String(error)}`;
   }
-}, { // Add body schema validation
+}, {
   body: t.Object({
     gofileUrl: t.String({ format: 'uri', error: 'Invalid URL format provided.' })
   })

@@ -19,6 +19,7 @@
     "cheerio": "^1.0.0",
     "elysia": "^1.2.25",
     "express": "^5.1.0",
+    "node-fetch": "^3.3.2",
     "puppeteer": "^24.7.2"
   }
 }
