@@ -1,33 +1,32 @@
-import express from 'express';
-import type { Request, Response } from 'express'; // Use type-only import
-import puppeteer from 'puppeteer';
-import * as cheerio from 'cheerio'; // Changed to namespace import
+import { Elysia, t } from 'elysia'; // Import Elysia and t for validation
+import { html } from '@elysiajs/html'; // Import html plugin
+import staticPlugin from '@elysiajs/static'; // Import static plugin
+import * as puppeteer from 'puppeteer'; // Use namespace import
+import * as cheerio from 'cheerio';
 import path from 'path';
-import fs from 'fs/promises'; // Use promises for async file operations
-
-const app = express();
-const port = 3000;
-
-// Middleware to parse URL-encoded bodies (as sent by HTML forms)
-app.use(express.urlencoded({ extended: true }));
-
-// Middleware to serve static files (like screenshots)
-// Need to figure out __dirname in ES Modules context
+import fs from 'fs/promises';
 import { fileURLToPath } from 'url';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-app.use('/public', express.static(path.join(__dirname, 'public')));
 
+const app = new Elysia()
+  .use(html()) // Use the HTML plugin
+  .use(staticPlugin({ // Use the static plugin to serve 'public' directory
+    assets: path.join(__dirname, 'public'),
+    prefix: '/public'
+  }));
 
-// Route to display the form
-app.get('/', (req: Request, res: Response) => {
-  res.send(`
+const port = 3000;
+
+// Route to display the form using @elysiajs/html
+app.get('/', ({ html }) => html(`
     <!DOCTYPE html>
     <html lang="en">
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Gofile Video Fetcher</title>
+      <title>Gofile Video Fetcher (Elysia)</title>
       <style>
         body { font-family: sans-serif; margin: 2em; background-color: #f4f4f4; }
         form { background: #fff; padding: 20px; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
@@ -45,32 +44,34 @@ app.get('/', (req: Request, res: Response) => {
       <form action="/fetch" method="POST">
         <label for="gofileUrl">Gofile URL:</label>
         <input type="url" id="gofileUrl" name="gofileUrl" required>
-        <button type=\"submit\">Fetch Video</button>
+        <button type="submit">Fetch Video</button>
       </form>
     </body>
     </html>
-  `);
-});
+  `));
+
 
 // Route to handle form submission and fetch video
-// Explicitly type the handler return as Promise<void> to fix overload error
-app.post('/fetch', async (req: Request, res: Response): Promise<void> => {
-  const gofileUrl = req.body.gofileUrl;
+// Use Elysia's context (ctx) and body validation
+app.post('/fetch', async ({ body, set, html: htmlResponse }) => { // Destructure context, use htmlResponse alias
+  const gofileUrl = body.gofileUrl;
 
+  // Validation is handled by Elysia's schema below, but keep basic check just in case
   if (!gofileUrl || typeof gofileUrl !== 'string') {
-     res.status(400).send('Invalid URL provided.');
-     return; // Ensure function exits
+     set.status = 400;
+     return 'Invalid URL provided.';
   }
 
-  let browser;
+  let browser: puppeteer.Browser | null = null; // Correct type for browser
   try {
     console.log(`Fetching URL: ${gofileUrl}`);
     browser = await puppeteer.launch({
-      headless: true, // Changed from 'new' to boolean true
+      headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox'],
     });
     const page = await browser.newPage();
-    await page.goto(gofileUrl, { waitUntil: 'networkidle2', timeout: 60000 }); // Increased timeout
+    // Increased timeout to 50 seconds (50000 ms)
+    await page.goto(gofileUrl, { waitUntil: 'networkidle2', timeout: 50000 });
 
     // Wait for potential video element
     const mediaSelector = 'video source[src], video[src]'; // Look for video source or video with src
@@ -82,7 +83,7 @@ app.post('/fetch', async (req: Request, res: Response): Promise<void> => {
         console.log('Video element selector found.');
 
         // Wait for the media to potentially load its source attribute
-        await page.evaluate((selector) => {
+        await page.evaluate((selector: string) => { // Add type for selector
             const media = document.querySelector(selector);
             return new Promise<void>((resolve) => { // Explicitly type Promise
                 if (!media) return resolve();
@@ -110,7 +111,7 @@ app.post('/fetch', async (req: Request, res: Response): Promise<void> => {
         }, mediaSelector);
 
 
-        videoSrc = await page.evaluate((selector) => {
+        videoSrc = await page.evaluate((selector: string) => { // Add type for selector
             const element = document.querySelector(selector);
             // Check if it's a source element inside a video or the video itself
             return element ? element.getAttribute('src') : null;
@@ -140,12 +141,13 @@ app.post('/fetch', async (req: Request, res: Response): Promise<void> => {
     console.log(`Screenshot saved to ${screenshotPathAbsolute}`);
 
 
+    // Get the full page content *before* closing the browser
+    let fetchedHtml = await page.content();
+
     // If Puppeteer didn't find the src, try parsing the full HTML with Cheerio as a fallback
-    let html = await page.content(); // Get page content
     if (!videoSrc) {
         console.log('Attempting Cheerio fallback...');
-        // const html = await page.content(); // Already fetched
-        const $ = cheerio.load(html);
+        const $ = cheerio.load(fetchedHtml); // Use the already fetched HTML
         const videoElement = $('video source[src]').first() || $('video[src]').first(); // Check source first, then video tag
         videoSrc = videoElement.attr('src') || null;
         if (videoSrc) {
@@ -158,8 +160,18 @@ app.post('/fetch', async (req: Request, res: Response): Promise<void> => {
     await browser.close();
     browser = null; // Ensure browser is marked as closed
 
-    // --- Start Modification ---
-    // Construct the results HTML to inject
+    // Save the *original* fetched HTML to output.html
+    const outputFilePath = path.join(__dirname, 'output.html');
+    try {
+        await fs.writeFile(outputFilePath, fetchedHtml); // Save the original fetched HTML
+        console.log(`Original fetched HTML saved to ${outputFilePath}`);
+    } catch (writeError) {
+        console.error(`Error writing original HTML to output.html: ${writeError}`);
+        // Decide if this error should prevent response or just be logged
+    }
+
+
+    // Construct the results HTML to inject into the response
     const resultsHtml = `
       <div style="border: 2px solid blue; padding: 15px; margin: 10px; background-color: #eee; color: #333; font-family: sans-serif;">
         <h2>Extraction Results</h2>
@@ -187,45 +199,39 @@ app.post('/fetch', async (req: Request, res: Response): Promise<void> => {
       </div>
     `;
 
-    // Inject the results HTML into the original page content
+    // Inject the results HTML into the original page content for the response
     // Find the closing </head> tag and insert results after it (simple approach)
-    // A more robust approach might use Cheerio again to parse and prepend to body
-    const headEndIndex = html.toLowerCase().indexOf('</head>');
-    let modifiedHtml = html;
+    const headEndIndex = fetchedHtml.toLowerCase().indexOf('</head>');
+    let modifiedHtmlResponse = fetchedHtml;
     if (headEndIndex !== -1) {
-        modifiedHtml = html.slice(0, headEndIndex + 7) + resultsHtml + html.slice(headEndIndex + 7);
+        modifiedHtmlResponse = fetchedHtml.slice(0, headEndIndex + 7) + resultsHtml + fetchedHtml.slice(headEndIndex + 7);
     } else {
         // Fallback: prepend to the whole HTML if </head> not found
-        modifiedHtml = resultsHtml + html;
+        modifiedHtmlResponse = resultsHtml + fetchedHtml;
     }
 
-
-    // Save the modified HTML to output.html
-    const outputFilePath = path.join(__dirname, 'output.html');
-    try {
-        await fs.writeFile(outputFilePath, modifiedHtml);
-        console.log(`Modified HTML saved to ${outputFilePath}`);
-    } catch (writeError) {
-        console.error(`Error writing to output.html: ${writeError}`);
-        // Don't stop the response if writing fails
-    }
-    // --- End Modification ---
-
-    // Send the MODIFIED HTML response back to client
-    res.send(modifiedHtml);
+    // Send the MODIFIED HTML response back to client using Elysia's html helper
+    return htmlResponse(modifiedHtmlResponse); // Use the aliased htmlResponse
 
   } catch (error) {
     console.error('Error processing request:', error);
     if (browser) {
-        await browser.close(); // Ensure browser is closed on error
+        try { // Add try-catch for browser close on error
+           await browser.close();
+        } catch (closeError) {
+           console.error('Error closing browser after main error:', closeError);
+        }
     }
-    // Ensure response is sent even on error
-    if (!res.headersSent) {
-        res.status(500).send(`Error fetching or processing the URL: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    set.status = 500;
+    // Return error message as plain text
+    return `Error fetching or processing the URL: ${error instanceof Error ? error.message : String(error)}`;
   }
+}, { // Add body schema validation
+  body: t.Object({
+    gofileUrl: t.String({ format: 'uri', error: 'Invalid URL format provided.' })
+  })
 });
 
 app.listen(port, () => {
-  console.log(`Server listening at http://localhost:${port}`);
+  console.log(`🦊 Elysia server listening at http://localhost:${port}`);
 });
